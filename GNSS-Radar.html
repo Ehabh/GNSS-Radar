@@ -88,6 +88,7 @@ html, body,
     box-shadow: 0 0 2px rgba(0,0,0,0.7);
     white-space: nowrap;
     overflow: hidden;
+    cursor: pointer;
 }
 </style>
 <script type="text/javascript" src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -357,7 +358,7 @@ function computeAllAzEl() {
 // Leaflet map
 // ---------------------------------------------------------------------------
 function initMap() {
-    map = L.map('map', { worldCopyJump: true }).setView([orglat, orglon], 3);
+    map = L.map('map', { worldCopyJump: true, preferCanvas: true }).setView([orglat, orglon], 3);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -404,7 +405,73 @@ function satBadgeIcon(sat, sys) {
 function buildMarkers() {
     forEachSat(function (sat, sys) {
         sat.marker = L.marker([0, 0], { icon: satBadgeIcon(sat, sys) });
+        sat.marker.on('mouseover', function () { if (!pinnedSat) showOrbit(sat, sys); });
+        sat.marker.on('mouseout', function () { if (!pinnedSat) clearOrbit(); });
+        sat.marker.on('click', function () {
+            if (pinnedSat === sat) { pinnedSat = null; clearOrbit(); }
+            else { pinnedSat = sat; showOrbit(sat, sys); }
+        });
     });
+}
+
+// ---------------------------------------------------------------------------
+// Orbit ground track - computed lazily (and cached) for one satellite at a
+// time, on hover/click. Drawing every satellite's full orbit simultaneously
+// (100+ overlapping loops) was tried and is unreadable, so this only ever
+// shows one track at a time: a live preview on hover, "pinned" on click
+// until you click the same satellite again or pick a different one.
+// ---------------------------------------------------------------------------
+var orbitLayer = null;
+var pinnedSat = null;
+
+function computeGroundTrack(sat) {
+    if (sat.groundTrack) return sat.groundTrack; // cache: shape doesn't change within a session
+    ensureSatrec(sat);
+    var periodMin = 2 * Math.PI / sat.satrec.no; // satrec.no is mean motion in rad/min
+    var steps = Math.max(60, Math.min(1500, Math.ceil(periodMin)));
+    var dtMs = (periodMin * 60000) / steps;
+    var base = (times && times[0]) ? times[0] : new Date();
+    var pts = [];
+    for (var i = 0; i <= steps; i++) {
+        var t = new Date(base.getTime() + i * dtMs);
+        try {
+            var llh = computeSatLLH(sat, t);
+            pts.push([llh.latitude * R2D, normalizeLon(llh.longitude * R2D)]);
+        } catch (e) { /* skip unpropagatable point, keep the rest of the track */ }
+    }
+    sat.groundTrack = splitAtAntimeridian(pts);
+    return sat.groundTrack;
+}
+
+// Break the point list into separate segments wherever the ground track
+// crosses +/-180deg longitude, so Leaflet doesn't draw a spurious straight
+// line all the way across the map at the antimeridian.
+function splitAtAntimeridian(pts) {
+    var segments = [];
+    var current = [];
+    for (var i = 0; i < pts.length; i++) {
+        if (current.length > 0 && Math.abs(pts[i][1] - current[current.length - 1][1]) > 180) {
+            segments.push(current);
+            current = [];
+        }
+        current.push(pts[i]);
+    }
+    if (current.length > 0) segments.push(current);
+    return segments;
+}
+
+function showOrbit(sat, sys) {
+    clearOrbit();
+    orbitLayer = L.polyline(computeGroundTrack(sat), {
+        color: SYS_COLOR[sys].hex,
+        weight: 1.5,
+        opacity: 0.85,
+        interactive: false
+    }).addTo(map);
+}
+
+function clearOrbit() {
+    if (orbitLayer) { map.removeLayer(orbitLayer); orbitLayer = null; }
 }
 
 function normalizeLon(lon) {
@@ -438,6 +505,10 @@ function applyVisibilityToMap() {
         if (shouldShow && !onMap) sat.marker.addTo(map);
         else if (!shouldShow && onMap) map.removeLayer(sat.marker);
     });
+    if (pinnedSat && !map.hasLayer(pinnedSat.marker)) {
+        pinnedSat = null;
+        clearOrbit();
+    }
 }
 
 // ---------------------------------------------------------------------------
