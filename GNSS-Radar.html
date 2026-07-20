@@ -72,11 +72,28 @@ html, body,
 #statusbar.ok { border-color: #2a7a2a; }
 #statusbar.warn { border-color: #a06a00; background: rgba(255,247,224,0.95); }
 #statusbar.error { border-color: #a01414; background: rgba(255,230,230,0.95); }
+.leaflet-div-icon {
+    background: transparent;
+    border: none;
+}
+.sat-badge {
+    width: 100%;
+    height: 100%;
+    line-height: 18px;
+    border-radius: 9px;
+    color: #fff;
+    font: 700 10px/18px Arial, sans-serif;
+    text-align: center;
+    border: 1px solid rgba(255,255,255,0.85);
+    box-shadow: 0 0 2px rgba(0,0,0,0.7);
+    white-space: nowrap;
+    overflow: hidden;
+}
 </style>
 <script type="text/javascript" src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
   integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script type="text/javascript" src="gnssradar/lib/highchartsv4/adapters/standalone-framework.js"></script>
-<script type="text/javascript" src="gnssradar/lib/highchartsv4/highcharts.js"></script>  
+<script type="text/javascript" src="gnssradar/lib/highchartsv4/highcharts.js"></script>
 <script type="text/javascript" src="gnssradar/lib/highchartsv4/modules/exporting.js"></script>
 <script type="text/javascript" src="gnssradar/lib/highchartsv4/highcharts-more.js"></script>
 <script type="text/javascript" src="gnssradar/lib/satellite/satellite.js"></script>
@@ -114,22 +131,13 @@ var SYS_COLOR = {
     QZSS:     { line: 'rgba(0,0,255,0.5)',   dark: 'rgba(0,0,205,0.8)',   hex: '#0000FF' },
     SBAS:     { line: 'rgba(0,128,128,0.5)', dark: 'rgba(0,100,100,0.8)', hex: '#008080' }
 };
-var SYS_ICON_FILE = {
-    GPS: 'GPS.png', GLONASS: 'GLONASS.png', Galileo: 'GALILEO.png',
-    BeiDou: 'BeiDou.png', QZSS: 'QZSS.png', SBAS: 'SBAS.png'
-};
-// pixel size / anchor point of each icon file, taken from the source images
-var SYS_ICON_GEOM = {
-    GPS:     { size: [100, 73], anchor: [50, 41] },
-    GLONASS: { size: [90, 49],  anchor: [39, 26] },
-    Galileo: { size: [110, 55], anchor: [71, 34] },
-    BeiDou:  { size: [100, 85], anchor: [45, 48] },
-    QZSS:    { size: [100, 68], anchor: [40, 25] },
-    SBAS:    { size: [100, 70], anchor: [47, 37] }
-};
+// Satellites are drawn as small colored "badge" markers (constellation
+// color + PRN number), not full-size illustrated icons - with 100+
+// satellites on screen at once, big icons just overlap into noise.
+var SAT_BADGE_SIZE = [24, 18];   // [width, height] in px
+var SAT_BADGE_ANCHOR = [12, 9];  // center the badge on the actual satellite position
 
 var map, orgmarker;
-var icons = {};
 var gnssData = null;      // { GPS:[sat,...], GLONASS:[...], ... }
 var visstate = { GPS: true, GLONASS: true, Galileo: true, BeiDou: true, QZSS: true, SBAS: true };
 var skychart, nsatchart;
@@ -355,15 +363,6 @@ function initMap() {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     }).addTo(map);
 
-    SYS.forEach(function (sys) {
-        var g = SYS_ICON_GEOM[sys];
-        icons[sys] = L.icon({
-            iconUrl: './gnssradar/icon/' + SYS_ICON_FILE[sys],
-            iconSize: g.size,
-            iconAnchor: g.anchor
-        });
-    });
-
     var observerIcon = L.icon({
         iconUrl: './gnssradar/icon/rangerstation.png',
         shadowUrl: './gnssradar/icon/rangerstation.shadow.png',
@@ -393,9 +392,18 @@ function observerTooltip() {
     return 'Observer (drag me!)\nLat: ' + orglat.toFixed(4) + '\nLon: ' + orglon.toFixed(4);
 }
 
+function satBadgeIcon(sat, sys) {
+    return L.divIcon({
+        className: 'sat-badge-wrap',
+        html: '<div class="sat-badge" style="background:' + SYS_COLOR[sys].hex + '">' + sat.prn + '</div>',
+        iconSize: SAT_BADGE_SIZE,
+        iconAnchor: SAT_BADGE_ANCHOR
+    });
+}
+
 function buildMarkers() {
     forEachSat(function (sat, sys) {
-        sat.marker = L.marker([0, 0], { icon: icons[sys] });
+        sat.marker = L.marker([0, 0], { icon: satBadgeIcon(sat, sys) });
     });
 }
 
