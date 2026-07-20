@@ -409,7 +409,7 @@ function buildMarkers() {
         sat.marker.on('mouseout', function () { if (!pinnedSat) clearOrbit(); });
         sat.marker.on('click', function () {
             if (pinnedSat === sat) { pinnedSat = null; clearOrbit(); }
-            else { pinnedSat = sat; showOrbit(sat, sys); }
+            else { pinnedSat = sat; pinnedSys = sys; showOrbit(sat, sys); }
         });
     });
 }
@@ -423,23 +423,29 @@ function buildMarkers() {
 // ---------------------------------------------------------------------------
 var orbitLayer = null;
 var pinnedSat = null;
+var pinnedSys = null;
 
 function computeGroundTrack(sat) {
-    if (sat.groundTrack) return sat.groundTrack; // cache: shape doesn't change within a session
+    // Cache is keyed to the currently selected time index: the track is
+    // centered on the satellite's current displayed position, so it has to
+    // be recomputed if the user moves to a different point in time.
+    if (sat.groundTrack && sat.groundTrackTind === tind) return sat.groundTrack;
     ensureSatrec(sat);
     var periodMin = 2 * Math.PI / sat.satrec.no; // satrec.no is mean motion in rad/min
     var steps = Math.max(60, Math.min(1500, Math.ceil(periodMin)));
     var dtMs = (periodMin * 60000) / steps;
-    var base = (times && times[0]) ? times[0] : new Date();
+    var center = (times && times[tind]) ? times[tind] : new Date();
+    var startMs = center.getTime() - (periodMin * 60000) / 2; // half a period BEFORE...
     var pts = [];
     for (var i = 0; i <= steps; i++) {
-        var t = new Date(base.getTime() + i * dtMs);
-        try {
-            var llh = computeSatLLH(sat, t);
+        var t = new Date(startMs + i * dtMs); // ...to half a period AFTER, so the
+        try {                                 // track passes through the current position
+            var llh = computeSatLLH(sat, t);  // instead of only extending forward from it
             pts.push([llh.latitude * R2D, normalizeLon(llh.longitude * R2D)]);
         } catch (e) { /* skip unpropagatable point, keep the rest of the track */ }
     }
     sat.groundTrack = splitAtAntimeridian(pts);
+    sat.groundTrackTind = tind;
     return sat.groundTrack;
 }
 
@@ -507,6 +513,7 @@ function applyVisibilityToMap() {
     });
     if (pinnedSat && !map.hasLayer(pinnedSat.marker)) {
         pinnedSat = null;
+        pinnedSys = null;
         clearOrbit();
     }
 }
@@ -628,6 +635,7 @@ function nsatchartdraw(nsatplts, times, llh, elemask) {
                             }
                             tind = this.x;
                             refreshMapMarkers(tind);
+                            if (pinnedSat) showOrbit(pinnedSat, pinnedSys);
                             dop = computeDop(tind);
                             skychartdraw(genAllSkyplotData(tind));
                         }
