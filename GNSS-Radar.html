@@ -33,6 +33,7 @@ html, body,
     height: 100%;
 }
 #map {
+    position: relative;
     float: left;
     margin: 0;
     width: 55%;
@@ -72,6 +73,32 @@ html, body,
 #statusbar.ok { border-color: #2a7a2a; }
 #statusbar.warn { border-color: #a06a00; background: rgba(255,247,224,0.95); }
 #statusbar.error { border-color: #a01414; background: rgba(255,230,230,0.95); }
+#syspanel {
+    position: absolute;
+    z-index: 1000;
+    right: 8px;
+    top: 8px;
+    padding: 6px 10px;
+    font: 12px/1.6 sans-serif;
+    background: rgba(255,255,255,0.92);
+    border: 1px solid #999;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+.syspanel-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.syspanel-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 1px solid rgba(0,0,0,0.4);
+}
 .leaflet-div-icon {
     background: transparent;
     border: none;
@@ -102,7 +129,10 @@ html, body,
 </head>
 <body>
 <div id="box1">
-<div id="map"><div id="statusbar">Loading live GNSS constellation data&hellip;</div></div>
+<div id="map">
+    <div id="statusbar">Loading live GNSS constellation data&hellip;</div>
+    <div id="syspanel"></div>
+</div>
 <div id="box2">
 <div id="nsatchart"></div>
 <div id="skychart"></div>
@@ -167,6 +197,7 @@ async function main() {
 
     initMap();
     buildMarkers();
+    buildConstellationPanel();
 
     var time = new Date();
     utcoffset = time.getTimezoneOffset();
@@ -725,21 +756,78 @@ function skychartdraw(skyplts) {
     skychart = new Highcharts.Chart(plotdata);
 }
 
+// Single source of truth for constellation on/off state. Both the sky-chart
+// legend (Highcharts show/hide events) and the map's checkbox panel call
+// into this, and it keeps the other one in sync. `source` tracks which UI
+// triggered the change so we don't recurse: e.g. the panel checkbox calls
+// skychart.series.hide(), which fires Highcharts' own 'hide' event, which
+// would call back in here - the syncInProgress guard makes that a no-op
+// instead of an infinite loop (the first pass already did all the work).
+var syncInProgress = false;
+
+function setConstellationVisible(sys, visible, source) {
+    if (syncInProgress) return;
+    syncInProgress = true;
+    try {
+        visstate[sys] = visible;
+        applyVisibilityToMap();
+        dop = computeDop(tind);
+
+        var idx = SYS.indexOf(sys);
+        var sp = nsatchart.options.subtitle.text.split('<br>');
+        var newtext = sp[0] + '<br>' + 'Mask:' + elemask.toString() + ' deg' +
+            ', HDOP:' + dop.hdop.toFixed(1) + ', PDOP:' + dop.pdop.toFixed(1);
+        nsatchart.setTitle(nsatchart.options.title, { text: newtext });
+        if (visible) nsatchart.series[idx].show();
+        else nsatchart.series[idx].hide();
+
+        if (panelCheckboxes[sys]) panelCheckboxes[sys].checked = visible;
+
+        if (source !== 'chart' && skychart && skychart.series[idx]) {
+            if (visible) skychart.series[idx].show();
+            else skychart.series[idx].hide();
+        }
+    } finally {
+        syncInProgress = false;
+    }
+}
+
 function onLegendToggle(series, visible) {
-    // NOTE: this only toggles the OTHER chart's matching series (nsatchart).
-    // Calling show()/hide() on `series` itself here would re-fire this same
-    // show/hide event and recurse forever - Highcharts has already applied
-    // the visibility change to `series` by the time this handler runs.
-    var sys = SYS[series.index];
-    visstate[sys] = visible;
-    applyVisibilityToMap();
-    dop = computeDop(tind);
-    var sp = nsatchart.options.subtitle.text.split('<br>');
-    var newtext = sp[0] + '<br>' + 'Mask:' + elemask.toString() + ' deg' +
-        ', HDOP:' + dop.hdop.toFixed(1) + ', PDOP:' + dop.pdop.toFixed(1);
-    nsatchart.setTitle(nsatchart.options.title, { text: newtext });
-    if (visible) nsatchart.series[series.index].show();
-    else nsatchart.series[series.index].hide();
+    setConstellationVisible(SYS[series.index], visible, 'chart');
+}
+
+// ---------------------------------------------------------------------------
+// Map panel: checkbox per constellation, overlaid on the map, kept in sync
+// with the sky-chart legend via setConstellationVisible() above.
+// ---------------------------------------------------------------------------
+var panelCheckboxes = {};
+
+function buildConstellationPanel() {
+    var panel = document.getElementById('syspanel');
+    SYS.forEach(function (sys) {
+        var row = document.createElement('label');
+        row.className = 'syspanel-row';
+
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = visstate[sys];
+        cb.addEventListener('change', function () {
+            setConstellationVisible(sys, cb.checked, 'panel');
+        });
+        panelCheckboxes[sys] = cb;
+
+        var swatch = document.createElement('span');
+        swatch.className = 'syspanel-swatch';
+        swatch.style.background = SYS_COLOR[sys].hex;
+
+        var label = document.createElement('span');
+        label.textContent = sys + ' (' + gnssData[sys].length + ')';
+
+        row.appendChild(cb);
+        row.appendChild(swatch);
+        row.appendChild(label);
+        panel.appendChild(row);
+    });
 }
 </script>
 </body>
