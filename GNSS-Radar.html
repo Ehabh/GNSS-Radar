@@ -20,26 +20,38 @@
 <!--
   Content-Security-Policy: allow-lists exactly the external origins this
   page actually talks to (unpkg.com for Leaflet, celestrak.org for live TLE
-  data, OpenStreetMap tile servers for map imagery) and nothing else. Note:
-  script-src needs 'unsafe-inline' because the whole app is one inline
-  <script> block rather than an external .js file - that means this CSP
-  does NOT block inline event-handler-based script execution (a stricter
-  policy would require moving the script to its own file + a nonce/hash).
+  data, OpenStreetMap tile servers for map imagery) and nothing else. Notes:
+  - script-src needs 'unsafe-inline' because the whole app is one inline
+    <script> block rather than an external .js file - that means this CSP
+    does NOT block inline event-handler-based script execution (a stricter
+    policy would require moving the script to its own file + a nonce/hash).
+  - script-src also needs 'unsafe-eval': gnssradar/lib/sylvester/sylvester.js
+    ships in the old "packer" format and self-decompresses via eval() at
+    load time. That file is a fixed, locally-vendored library (not
+    attacker-influenced input), so allowing eval() here doesn't reopen the
+    XSS issue satTooltipContent() fixes - it's a different, unrelated
+    trust boundary (code we ship vs. data we render).
+  - frame-ancestors is deliberately omitted: it's silently ignored when a
+    CSP is delivered via <meta> (browsers only honor it from an HTTP
+    response header), so including it here would just be dead weight that
+    looks like protection it isn't. If clickjacking protection matters for
+    your deployment, set it as a real HTTP header at the server (e.g. an
+    nginx/Apache config, or a small server script instead of plain
+    `python -m http.server`, which doesn't support custom headers).
   It still blocks loading any *other* script origin, restricts where
-  fetch()/XHR can send data, and adds clickjacking/plugin/base-tag
-  hardening - real defense-in-depth, just not a substitute for sanitizing
-  untrusted input at the point it's rendered (see satTooltipContent()).
+  fetch()/XHR can send data, and adds plugin/base-tag hardening - real
+  defense-in-depth, just not a substitute for sanitizing untrusted input
+  at the point it's rendered (see satTooltipContent()).
 -->
 <meta http-equiv="Content-Security-Policy" content="
     default-src 'self';
-    script-src 'self' 'unsafe-inline' https://unpkg.com;
+    script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com;
     style-src 'self' 'unsafe-inline' https://unpkg.com;
     img-src 'self' data: https://*.tile.openstreetmap.org;
     connect-src 'self' https://celestrak.org;
     font-src 'self';
     object-src 'none';
     base-uri 'self';
-    frame-ancestors 'none';
 ">
 <meta name="twitter:card" content="photo" />
 <meta name="twitter:site" content="@Taro_Suzuki" />
