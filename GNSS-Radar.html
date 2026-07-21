@@ -17,6 +17,30 @@
 <title>GNSS Radar</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <meta charset="UTF-8">
+<!--
+  Content-Security-Policy: allow-lists exactly the external origins this
+  page actually talks to (unpkg.com for Leaflet, celestrak.org for live TLE
+  data, OpenStreetMap tile servers for map imagery) and nothing else. Note:
+  script-src needs 'unsafe-inline' because the whole app is one inline
+  <script> block rather than an external .js file - that means this CSP
+  does NOT block inline event-handler-based script execution (a stricter
+  policy would require moving the script to its own file + a nonce/hash).
+  It still blocks loading any *other* script origin, restricts where
+  fetch()/XHR can send data, and adds clickjacking/plugin/base-tag
+  hardening - real defense-in-depth, just not a substitute for sanitizing
+  untrusted input at the point it's rendered (see satTooltipContent()).
+-->
+<meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self' 'unsafe-inline' https://unpkg.com;
+    style-src 'self' 'unsafe-inline' https://unpkg.com;
+    img-src 'self' data: https://*.tile.openstreetmap.org;
+    connect-src 'self' https://celestrak.org;
+    font-src 'self';
+    object-src 'none';
+    base-uri 'self';
+    frame-ancestors 'none';
+">
 <meta name="twitter:card" content="photo" />
 <meta name="twitter:site" content="@Taro_Suzuki" />
 <meta name="twitter:domain" content="www.taroz.net/GNSS-Radar.html" />
@@ -515,6 +539,28 @@ function normalizeLon(lon) {
     return ((lon + 180) % 360 + 360) % 360 - 180;
 }
 
+// Builds tooltip content as real DOM nodes with .textContent, not a string.
+// sat.name comes from the live CelesTrak feed - an external, unauthenticated
+// source - and Leaflet renders *string* tooltip content as raw HTML (this is
+// documented, intentional Leaflet behavior, not a bug in Leaflet). Passing a
+// DOM element built with textContent instead means whatever CelesTrak (or
+// the offline fallback file, or any future data source) sends can never be
+// interpreted as markup, no matter what it contains.
+function satTooltipContent(sat, lat, lon) {
+    var wrap = document.createElement('div');
+    [
+        sat.name,
+        'PRN: ' + sat.prn + (sat.prnIsOfficial ? '' : ' (display index, see readme)'),
+        'Lat: ' + lat.toFixed(2),
+        'Lon: ' + lon.toFixed(2)
+    ].forEach(function (line) {
+        var row = document.createElement('div');
+        row.textContent = line;
+        wrap.appendChild(row);
+    });
+    return wrap;
+}
+
 function refreshMapMarkers(ind) {
     forEachSat(function (sat, sys) {
         var llh = sat.llh[ind];
@@ -522,11 +568,7 @@ function refreshMapMarkers(ind) {
             var lat = llh.latitude * R2D;
             var lon = normalizeLon(llh.longitude * R2D);
             sat.marker.setLatLng([lat, lon]);
-            sat.marker.bindTooltip(
-                sat.name + '\nPRN: ' + sat.prn + (sat.prnIsOfficial ? '' : ' (display index, see readme)') +
-                '\nLat: ' + lat.toFixed(2) + '\nLon: ' + lon.toFixed(2),
-                { direction: 'top' }
-            );
+            sat.marker.bindTooltip(satTooltipContent(sat, lat, lon), { direction: 'top' });
             sat.exist = true;
         } else {
             sat.exist = false;
