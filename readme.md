@@ -82,6 +82,46 @@ Reproduced the crash and confirmed the fix in a headless DOM before shipping it.
   legend (in the bottom-right chart) - toggling either one updates the other.
 
 -------------------------------------------------------------------------------
+## 4. Security hardening
+
+A review turned up one real issue and one gap, both now fixed:
+
+* **Stored XSS via satellite names (fixed).** Satellite marker tooltips were
+  built by concatenating `sat.name` - text that comes from the **live
+  CelesTrak feed**, an external, unauthenticated source - into a string
+  passed to Leaflet's `bindTooltip()`. Leaflet renders string tooltip
+  content as raw HTML by design (this is documented Leaflet behavior, not a
+  bug in Leaflet - see their reference docs and the recent CVE-2025-69993
+  advisory for the identical `bindPopup()` case). In practice CelesTrak is a
+  reputable, curated source, so the realistic risk was low, but the app was
+  rendering third-party network data as HTML with no sanitization - the
+  textbook setup for this bug class. **Fix:** tooltip content is now built as
+  real DOM nodes with `.textContent` (`satTooltipContent()` in
+  `GNSS-Radar.html`), which Leaflet's own docs recommend for exactly this
+  situation - whatever CelesTrak sends can never be interpreted as markup.
+* **Content-Security-Policy (added).** The page previously had no CSP at
+  all. Added one as a `<meta>` tag, allow-listing only the origins the page
+  actually uses (`unpkg.com`, `celestrak.org`, OpenStreetMap tiles).
+  Two things worth knowing about it:
+    * `script-src` includes `'unsafe-inline'` because the whole app is one
+      inline `<script>` block rather than an external `.js` file - so this
+      CSP does **not** block inline event-handler-based script execution. A
+      stricter policy would need the script moved to its own file with a
+      nonce/hash, which hasn't been done.
+    * `script-src` also includes `'unsafe-eval'`, required because
+      `gnssradar/lib/sylvester/sylvester.js` ships in the old "packer"
+      format and self-decompresses via `eval()` at load time - confirmed
+      it's the only bundled library that needs this. That's vendored code
+      we ship, not attacker-influenced data, so it's a different trust
+      boundary from the XSS fix above and doesn't reopen it.
+    * `frame-ancestors` was deliberately **left out**: it's silently
+      ignored when a CSP is delivered via `<meta>` (only an HTTP response
+      header enforces it), so including it would just be dead weight that
+      looks like protection it isn't. Real clickjacking protection needs a
+      server-level header - not possible with plain
+      `python -m http.server`, and out of scope for a static-file repo.
+
+-------------------------------------------------------------------------------
 Running it
 -------------------------------------------------------------------------------
 Like the original, this must be served over HTTP(S), not opened as a
