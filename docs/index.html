@@ -1,0 +1,888 @@
+<!------------------------------------------------------------------------------
+* Copyright (C) 2014 Taro Suzuki <gnsssdrlib@gmail.com>
+* Modernization pass (2026): async live TLE loading, Leaflet map, dynamic PRN
+* parsing straight from CelesTrak TLE names (no more stale/static satlist.txt
+* for GPS, QZSS, SBAS, BeiDou). See readme.md for details of what changed.
+*
+* This script uses the following libraries :
+* satellite.js :https://github.com/shashwatak/satellite-js
+* highcharts.js: https://www.highcharts.com/
+* Sylvester.js: https://sylvester.jcoglan.com/
+* Leaflet.js: https://leafletjs.com/
+* TLE is downloaded live from https://celestrak.org/
+*------------------------------------------------------------------------------>
+<!DOCTYPE html>
+<html>
+<head>
+<title>GNSS Radar</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta charset="UTF-8">
+<!--
+  Content-Security-Policy: allow-lists exactly the external origins this
+  page actually talks to (unpkg.com for Leaflet, celestrak.org for live TLE
+  data, OpenStreetMap tile servers for map imagery) and nothing else. Notes:
+  - script-src needs 'unsafe-inline' because the whole app is one inline
+    <script> block rather than an external .js file - that means this CSP
+    does NOT block inline event-handler-based script execution (a stricter
+    policy would require moving the script to its own file + a nonce/hash).
+  - script-src also needs 'unsafe-eval': gnssradar/lib/sylvester/sylvester.js
+    ships in the old "packer" format and self-decompresses via eval() at
+    load time. That file is a fixed, locally-vendored library (not
+    attacker-influenced input), so allowing eval() here doesn't reopen the
+    XSS issue satTooltipContent() fixes - it's a different, unrelated
+    trust boundary (code we ship vs. data we render).
+  - frame-ancestors is deliberately omitted: it's silently ignored when a
+    CSP is delivered via <meta> (browsers only honor it from an HTTP
+    response header), so including it here would just be dead weight that
+    looks like protection it isn't. If clickjacking protection matters for
+    your deployment, set it as a real HTTP header at the server (e.g. an
+    nginx/Apache config, or a small server script instead of plain
+    `python -m http.server`, which doesn't support custom headers).
+  It still blocks loading any *other* script origin, restricts where
+  fetch()/XHR can send data, and adds plugin/base-tag hardening - real
+  defense-in-depth, just not a substitute for sanitizing untrusted input
+  at the point it's rendered (see satTooltipContent()).
+-->
+<meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com;
+    style-src 'self' 'unsafe-inline' https://unpkg.com;
+    img-src 'self' data: https://*.tile.openstreetmap.org;
+    connect-src 'self' https://celestrak.org;
+    font-src 'self';
+    object-src 'none';
+    base-uri 'self';
+">
+<meta name="twitter:card" content="photo" />
+<meta name="twitter:site" content="@Taro_Suzuki" />
+<meta name="twitter:domain" content="www.taroz.net/GNSS-Radar.html" />
+<meta name="twitter:creator" content="@Taro_Suzuki" />
+<meta name="twitter:title" content="GNSS-Radar" />
+<meta name="twitter:image:src" content="https://www.taroz.net/img/diary/gnssradar.jpg" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+<style type="text/css">
+html, body,
+#box1{
+    margin: 0;
+    width: 100%;
+    height: 100%;
+}
+#map {
+    position: relative;
+    float: left;
+    margin: 0;
+    width: 55%;
+    height: 100%;
+    background: #0b1622;
+}
+#box2{
+    float: left;
+    margin: 0;
+    width: 45%;
+    height: 100%;
+}
+#nsatchart {
+    margin: 0;
+    width: 98%;
+    height: 40%;
+}
+#skychart {
+    float: right;
+    margin: 0;
+    width: 100%;
+    height: 60%;
+}
+#statusbar {
+    position: absolute;
+    z-index: 1000;
+    left: 8px;
+    top: 8px;
+    max-width: 60%;
+    padding: 6px 10px;
+    font: 12px/1.4 sans-serif;
+    background: rgba(255,255,255,0.92);
+    border: 1px solid #999;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+#statusbar.ok { border-color: #2a7a2a; }
+#statusbar.warn { border-color: #a06a00; background: rgba(255,247,224,0.95); }
+#statusbar.error { border-color: #a01414; background: rgba(255,230,230,0.95); }
+#syspanel {
+    position: absolute;
+    z-index: 1000;
+    right: 8px;
+    top: 8px;
+    padding: 6px 10px;
+    font: 12px/1.6 sans-serif;
+    background: rgba(255,255,255,0.92);
+    border: 1px solid #999;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+.syspanel-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.syspanel-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 1px solid rgba(0,0,0,0.4);
+}
+.leaflet-div-icon {
+    background: transparent;
+    border: none;
+}
+.sat-badge {
+    width: 100%;
+    height: 100%;
+    line-height: 18px;
+    border-radius: 9px;
+    color: #fff;
+    font: 700 10px/18px Arial, sans-serif;
+    text-align: center;
+    border: 1px solid rgba(255,255,255,0.85);
+    box-shadow: 0 0 2px rgba(0,0,0,0.7);
+    white-space: nowrap;
+    overflow: hidden;
+    cursor: pointer;
+}
+</style>
+<script type="text/javascript" src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script type="text/javascript" src="gnssradar/lib/highchartsv4/adapters/standalone-framework.js"></script>
+<script type="text/javascript" src="gnssradar/lib/highchartsv4/highcharts.js"></script>
+<script type="text/javascript" src="gnssradar/lib/highchartsv4/modules/exporting.js"></script>
+<script type="text/javascript" src="gnssradar/lib/highchartsv4/highcharts-more.js"></script>
+<script type="text/javascript" src="gnssradar/lib/satellite/satellite.js"></script>
+<script type="text/javascript" src="gnssradar/lib/sylvester/sylvester.js"></script>
+</head>
+<body>
+<div id="box1">
+<div id="map">
+    <div id="statusbar">Loading live GNSS constellation data&hellip;</div>
+    <div id="syspanel"></div>
+</div>
+<div id="box2">
+<div id="nsatchart"></div>
+<div id="skychart"></div>
+</div>
+</div>
+<script type="text/javascript">
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Constants / globals
+// ---------------------------------------------------------------------------
+var CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=gnss&FORMAT=tle';
+var FALLBACK_TLE_URL = 'gnssradar/celestrak.txt'; // bundled snapshot, used only if the live fetch fails
+var FETCH_TIMEOUT_MS = 12000;
+
+var D2R = Math.PI / 180;
+var R2D = 180 / Math.PI;
+var maxntimes = 200;
+
+// Systems in display/legend order (matches original app + chart colours)
+var SYS = ['GPS', 'GLONASS', 'Galileo', 'BeiDou', 'QZSS', 'SBAS'];
+var SYS_COLOR = {
+    GPS:      { line: 'rgba(0,128,0,0.5)',   dark: 'rgba(0,78,0,0.8)',    hex: '#008000' },
+    GLONASS:  { line: 'rgba(255,170,0,0.5)', dark: 'rgba(225,140,0,0.8)', hex: '#FFAA00' },
+    Galileo:  { line: 'rgba(255,0,255,0.5)', dark: 'rgba(205,0,205,0.8)', hex: '#FF00FF' },
+    BeiDou:   { line: 'rgba(255,0,0,0.5)',   dark: 'rgba(205,0,0,0.8)',   hex: '#FF0000' },
+    QZSS:     { line: 'rgba(0,0,255,0.5)',   dark: 'rgba(0,0,205,0.8)',   hex: '#0000FF' },
+    SBAS:     { line: 'rgba(0,128,128,0.5)', dark: 'rgba(0,100,100,0.8)', hex: '#008080' }
+};
+// Satellites are drawn as small colored "badge" markers (constellation
+// color + PRN number), not full-size illustrated icons - with 100+
+// satellites on screen at once, big icons just overlap into noise.
+var SAT_BADGE_SIZE = [24, 18];   // [width, height] in px
+var SAT_BADGE_ANCHOR = [12, 9];  // center the badge on the actual satellite position
+
+var map, orgmarker;
+var gnssData = null;      // { GPS:[sat,...], GLONASS:[...], ... }
+var visstate = { GPS: true, GLONASS: true, Galileo: true, BeiDou: true, QZSS: true, SBAS: true };
+var skychart, nsatchart;
+var dop;
+var tind = 0;
+var times = new Array(maxntimes);
+var utcoffset;
+var orglat, orglon, orgllh, elemask, offhr, tint, ntimes;
+var usingLiveData = null; // true/false once known
+
+// ---------------------------------------------------------------------------
+// Bootstrapping
+// ---------------------------------------------------------------------------
+main().catch(function (err) {
+    console.error(err);
+    setStatus('Failed to start GNSS-Radar: ' + err.message, 'error');
+});
+
+async function main() {
+    readOptionsFromUrl();
+
+    var loaded = await loadTLEText();
+    usingLiveData = loaded.live;
+    gnssData = parseGnssTLE(loaded.text);
+    reportDataStatus(loaded);
+
+    initMap();
+    buildMarkers();
+    buildConstellationPanel();
+
+    var time = new Date();
+    utcoffset = time.getTimezoneOffset();
+    time.setHours(time.getHours() + offhr);
+    for (var i = 0; i < ntimes; i++) {
+        times[i] = new Date(time.getTime());
+        time.setMinutes(time.getMinutes() + tint / 1000 / 60);
+    }
+
+    computeAllLLH();
+    computeAllAzEl();
+
+    refreshMapMarkers(tind);
+    applyVisibilityToMap();
+    dop = computeDop(tind);
+    skychartdraw(genAllSkyplotData(tind));
+    nsatchartdraw(genAllNsatplotData(), times, orgllh, elemask);
+}
+
+function readOptionsFromUrl() {
+    ntimes = getKey('ntimes', 24);
+    if (ntimes > maxntimes) ntimes = maxntimes;
+    tint = getKey('tint', 30) * 60 * 1000; // ms
+    elemask = getKey('elemask', 10);
+    orglat = getKey('lat', 35.7);
+    orglon = getKey('lon', 139.8);
+    offhr = getKey('offhr', 0);
+    orgllh = { latitude: orglat * D2R, longitude: orglon * D2R, height: 0 };
+}
+
+function getKey(key, def) {
+    var params = new URLSearchParams(location.search);
+    if (!params.has(key)) return def;
+    var v = Number(params.get(key));
+    return isNaN(v) ? def : v;
+}
+
+// ---------------------------------------------------------------------------
+// TLE loading (async, with a bundled offline fallback) + PRN parsing
+// ---------------------------------------------------------------------------
+function fetchWithTimeout(url, ms) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, ms);
+    return fetch(url, { cache: 'no-store', signal: controller.signal }).finally(function () {
+        clearTimeout(timer);
+    });
+}
+
+async function loadTLEText() {
+    try {
+        setStatus('Fetching live GNSS TLE data from CelesTrak\u2026', 'warn');
+        var resp = await fetchWithTimeout(CELESTRAK_URL, FETCH_TIMEOUT_MS);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var text = await resp.text();
+        var lineCount = text.split('\n').filter(function (l) { return l.trim().length > 0; }).length;
+        if (lineCount < 30) throw new Error('unexpectedly short response (' + lineCount + ' lines)');
+        return { text: text, live: true, fetchedAt: new Date() };
+    } catch (err) {
+        console.warn('Live CelesTrak fetch failed, falling back to bundled snapshot:', err);
+        var fresp = await fetch(FALLBACK_TLE_URL, { cache: 'no-store' });
+        var ftext = await fresp.text();
+        return { text: ftext, live: false, fetchedAt: null, error: err };
+    }
+}
+
+// CelesTrak's "gnss" group embeds the PRN/slot directly in the satellite
+// name for GPS, QZSS, SBAS and BeiDou, e.g.:
+//   "GPS BIII-1 (PRN 04)"        -> GPS PRN 4
+//   "QZS-2 (QZSS/PRN 194)"       -> QZSS PRN 194
+//   "SES-15 (WAAS/PRN 133)"      -> SBAS PRN 133
+//   "BEIDOU-2 IGSO-3 (C08)"      -> BeiDou PRN 8
+// GLONASS ("COSMOS ####") and Galileo ("GSAT0###") do NOT carry a slot/PRN
+// in this feed, so those two are given a stable display index instead
+// (sorted by NORAD ID) - see readme.md for why, and how to hand-map them
+// to official slot numbers if you need that precision.
+function parseGnssTLE(raw) {
+    var lines = raw.split(/\r?\n/).filter(function (l) { return l.trim().length > 0; });
+    var groups = { GPS: [], GLONASS: [], Galileo: [], BeiDou: [], QZSS: [], SBAS: [] };
+
+    for (var i = 0; i + 2 < lines.length; i += 3) {
+        var name = lines[i].trim();
+        var line1 = lines[i + 1];
+        var line2 = lines[i + 2];
+        if (line1.charAt(0) !== '1' || line2.charAt(0) !== '2') continue;
+
+        var sat = {
+            name: name,
+            line1: line1,
+            line2: line2,
+            noradId: line1.substring(2, 7).trim(),
+            satrec: null,
+            llh: new Array(maxntimes),
+            azel: new Array(maxntimes),
+            marker: null,
+            prnIsOfficial: true
+        };
+
+        var m;
+        if ((m = name.match(/^GPS\b.*\(PRN\s*0*(\d+)\)/i))) {
+            sat.prn = parseInt(m[1], 10); groups.GPS.push(sat);
+        } else if ((m = name.match(/QZS.*\(QZSS\/PRN\s*0*(\d+)\)/i))) {
+            sat.prn = parseInt(m[1], 10); groups.QZSS.push(sat);
+        } else if (/BEIDOU/i.test(name) && (m = name.match(/\(C0*(\d+)\)/i))) {
+            sat.prn = parseInt(m[1], 10); groups.BeiDou.push(sat);
+        } else if ((m = name.match(/\/PRN\s*0*(\d+)\)/i))) {
+            sat.prn = parseInt(m[1], 10); groups.SBAS.push(sat);
+        } else if (/^COSMOS/i.test(name)) {
+            sat.prnIsOfficial = false; groups.GLONASS.push(sat);
+        } else if (/^GSAT0/i.test(name)) {
+            sat.prnIsOfficial = false; groups.Galileo.push(sat);
+        }
+        // anything else in the feed (decommissioned/test/unknown objects) is skipped
+    }
+
+    ['GLONASS', 'Galileo'].forEach(function (sys) {
+        groups[sys].sort(function (a, b) { return Number(a.noradId) - Number(b.noradId); });
+        groups[sys].forEach(function (sat, idx) { sat.prn = idx + 1; });
+    });
+
+    return groups;
+}
+
+function reportDataStatus(loaded) {
+    var total = 0;
+    SYS.forEach(function (s) { total += gnssData[s].length; });
+    if (loaded.live) {
+        setStatus('Live CelesTrak data \u2014 ' + total + ' satellites (fetched ' +
+            loaded.fetchedAt.toLocaleTimeString() + ')', 'ok');
+    } else {
+        setStatus('\u26A0 Live fetch failed, showing bundled offline snapshot (' +
+            total + ' satellites, dated 2014) \u2014 positions will NOT match the ' +
+            'current constellation. See readme.md.', 'error');
+    }
+}
+
+function setStatus(msg, cls) {
+    var el = document.getElementById('statusbar');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = cls || '';
+}
+
+// ---------------------------------------------------------------------------
+// Orbit propagation
+// ---------------------------------------------------------------------------
+function ensureSatrec(sat) {
+    if (!sat.satrec) sat.satrec = satellite.twoline2satrec(sat.line1, sat.line2);
+}
+
+function computeSatLLH(sat, date) {
+    ensureSatrec(sat);
+    var y = date.getUTCFullYear(), m = date.getUTCMonth() + 1, d = date.getUTCDate();
+    var hr = date.getUTCHours(), min = date.getUTCMinutes(), sec = date.getUTCSeconds();
+    var gmst = satellite.gstime_from_date(y, m, d, hr, min, sec);
+    var sateci = satellite.propagate(sat.satrec, y, m, d, hr, min, sec);
+    return satellite.eci_to_geodetic(sateci['position'], gmst);
+}
+
+function computeSatAzEl(orgllh, satllh) {
+    var satecf = satellite.geodetic_to_ecf(satllh);
+    var azel = satellite.ecf_to_look_angles(orgllh, satecf);
+    azel.azimuth = azel.azimuth / Math.PI * 180;
+    azel.elevation = azel.elevation / Math.PI * 180;
+    return azel;
+}
+
+function forEachSat(fn) {
+    SYS.forEach(function (sys) { gnssData[sys].forEach(function (sat) { fn(sat, sys); }); });
+}
+
+function computeAllLLH() {
+    forEachSat(function (sat) {
+        for (var i = 0; i < ntimes; i++) {
+            try { sat.llh[i] = computeSatLLH(sat, times[i]); }
+            catch (e) { sat.llh[i] = null; }
+        }
+    });
+}
+
+function computeAllAzEl() {
+    forEachSat(function (sat) {
+        for (var i = 0; i < ntimes; i++) {
+            sat.azel[i] = sat.llh[i] ? computeSatAzEl(orgllh, sat.llh[i]) : null;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Leaflet map
+// ---------------------------------------------------------------------------
+function initMap() {
+    map = L.map('map', { worldCopyJump: true, preferCanvas: true }).setView([orglat, orglon], 3);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    var observerIcon = L.icon({
+        iconUrl: './gnssradar/icon/rangerstation.png',
+        shadowUrl: './gnssradar/icon/rangerstation.shadow.png',
+        iconSize: [32, 32], iconAnchor: [16, 32],
+        shadowSize: [59, 32], shadowAnchor: [16, 32]
+    });
+    orgmarker = L.marker([orglat, orglon], { icon: observerIcon, draggable: true, autoPan: true }).addTo(map);
+    orgmarker.bindTooltip(observerTooltip(), { direction: 'top' });
+
+    orgmarker.on('dragend', function () {
+        var ll = orgmarker.getLatLng();
+        orglat = ll.lat;
+        orglon = ll.lng;
+        orgllh = { latitude: orglat * D2R, longitude: orglon * D2R, height: 0 };
+        orgmarker.setTooltipContent(observerTooltip());
+        map.panTo(ll);
+
+        computeAllAzEl();
+        refreshMapMarkers(tind);
+        dop = computeDop(tind);
+        skychartdraw(genAllSkyplotData(tind));
+        nsatchartdraw(genAllNsatplotData(), times, orgllh, elemask);
+    });
+}
+
+function observerTooltip() {
+    return 'Observer (drag me!)\nLat: ' + orglat.toFixed(4) + '\nLon: ' + orglon.toFixed(4);
+}
+
+function satBadgeIcon(sat, sys) {
+    return L.divIcon({
+        className: 'sat-badge-wrap',
+        html: '<div class="sat-badge" style="background:' + SYS_COLOR[sys].hex + '">' + sat.prn + '</div>',
+        iconSize: SAT_BADGE_SIZE,
+        iconAnchor: SAT_BADGE_ANCHOR
+    });
+}
+
+function buildMarkers() {
+    forEachSat(function (sat, sys) {
+        sat.marker = L.marker([0, 0], { icon: satBadgeIcon(sat, sys) });
+        sat.marker.on('mouseover', function () { if (!pinnedSat) showOrbit(sat, sys); });
+        sat.marker.on('mouseout', function () { if (!pinnedSat) clearOrbit(); });
+        sat.marker.on('click', function () {
+            if (pinnedSat === sat) { pinnedSat = null; clearOrbit(); }
+            else { pinnedSat = sat; pinnedSys = sys; showOrbit(sat, sys); }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Orbit ground track - computed lazily (and cached) for one satellite at a
+// time, on hover/click. Drawing every satellite's full orbit simultaneously
+// (100+ overlapping loops) was tried and is unreadable, so this only ever
+// shows one track at a time: a live preview on hover, "pinned" on click
+// until you click the same satellite again or pick a different one.
+// ---------------------------------------------------------------------------
+var orbitLayer = null;
+var pinnedSat = null;
+var pinnedSys = null;
+
+function computeGroundTrack(sat) {
+    // Cache is keyed to the currently selected time index: the track is
+    // centered on the satellite's current displayed position, so it has to
+    // be recomputed if the user moves to a different point in time.
+    if (sat.groundTrack && sat.groundTrackTind === tind) return sat.groundTrack;
+    ensureSatrec(sat);
+    var periodMin = 2 * Math.PI / sat.satrec.no; // satrec.no is mean motion in rad/min
+    var steps = Math.max(60, Math.min(1500, Math.ceil(periodMin)));
+    var dtMs = (periodMin * 60000) / steps;
+    var center = (times && times[tind]) ? times[tind] : new Date();
+    var startMs = center.getTime() - (periodMin * 60000) / 2; // half a period BEFORE...
+    var pts = [];
+    for (var i = 0; i <= steps; i++) {
+        var t = new Date(startMs + i * dtMs); // ...to half a period AFTER, so the
+        try {                                 // track passes through the current position
+            var llh = computeSatLLH(sat, t);  // instead of only extending forward from it
+            pts.push([llh.latitude * R2D, normalizeLon(llh.longitude * R2D)]);
+        } catch (e) { /* skip unpropagatable point, keep the rest of the track */ }
+    }
+    sat.groundTrack = splitAtAntimeridian(pts);
+    sat.groundTrackTind = tind;
+    return sat.groundTrack;
+}
+
+// Break the point list into separate segments wherever the ground track
+// crosses +/-180deg longitude, so Leaflet doesn't draw a spurious straight
+// line all the way across the map at the antimeridian.
+function splitAtAntimeridian(pts) {
+    var segments = [];
+    var current = [];
+    for (var i = 0; i < pts.length; i++) {
+        if (current.length > 0 && Math.abs(pts[i][1] - current[current.length - 1][1]) > 180) {
+            segments.push(current);
+            current = [];
+        }
+        current.push(pts[i]);
+    }
+    if (current.length > 0) segments.push(current);
+    return segments;
+}
+
+function showOrbit(sat, sys) {
+    clearOrbit();
+    orbitLayer = L.polyline(computeGroundTrack(sat), {
+        color: SYS_COLOR[sys].hex,
+        weight: 1.5,
+        opacity: 0.85,
+        interactive: false
+    }).addTo(map);
+}
+
+function clearOrbit() {
+    if (orbitLayer) { map.removeLayer(orbitLayer); orbitLayer = null; }
+}
+
+function normalizeLon(lon) {
+    return ((lon + 180) % 360 + 360) % 360 - 180;
+}
+
+// Builds tooltip content as real DOM nodes with .textContent, not a string.
+// sat.name comes from the live CelesTrak feed - an external, unauthenticated
+// source - and Leaflet renders *string* tooltip content as raw HTML (this is
+// documented, intentional Leaflet behavior, not a bug in Leaflet). Passing a
+// DOM element built with textContent instead means whatever CelesTrak (or
+// the offline fallback file, or any future data source) sends can never be
+// interpreted as markup, no matter what it contains.
+function satTooltipContent(sat, lat, lon) {
+    var wrap = document.createElement('div');
+    [
+        sat.name,
+        'PRN: ' + sat.prn + (sat.prnIsOfficial ? '' : ' (display index, see readme)'),
+        'Lat: ' + lat.toFixed(2),
+        'Lon: ' + lon.toFixed(2)
+    ].forEach(function (line) {
+        var row = document.createElement('div');
+        row.textContent = line;
+        wrap.appendChild(row);
+    });
+    return wrap;
+}
+
+function refreshMapMarkers(ind) {
+    forEachSat(function (sat, sys) {
+        var llh = sat.llh[ind];
+        if (llh) {
+            var lat = llh.latitude * R2D;
+            var lon = normalizeLon(llh.longitude * R2D);
+            sat.marker.setLatLng([lat, lon]);
+            sat.marker.bindTooltip(satTooltipContent(sat, lat, lon), { direction: 'top' });
+            sat.exist = true;
+        } else {
+            sat.exist = false;
+        }
+    });
+    applyVisibilityToMap();
+}
+
+function applyVisibilityToMap() {
+    forEachSat(function (sat, sys) {
+        var shouldShow = sat.exist && visstate[sys];
+        var onMap = map.hasLayer(sat.marker);
+        if (shouldShow && !onMap) sat.marker.addTo(map);
+        else if (!shouldShow && onMap) map.removeLayer(sat.marker);
+    });
+    if (pinnedSat && !map.hasLayer(pinnedSat.marker)) {
+        pinnedSat = null;
+        pinnedSys = null;
+        clearOrbit();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chart data
+// ---------------------------------------------------------------------------
+function genSkyplotData(sats, ind) {
+    var plt = [];
+    sats.forEach(function (sat) {
+        var azel = sat.azel[ind];
+        if (azel && azel.elevation > elemask) {
+            plt.push({
+                name: sat.prn.toString(),
+                x: Math.round(azel.azimuth * 10) / 10,
+                y: Math.round(azel.elevation * 10) / 10
+            });
+        }
+    });
+    return plt;
+}
+
+function genAllSkyplotData(ind) {
+    var o = {};
+    SYS.forEach(function (s) { o[s] = genSkyplotData(gnssData[s], ind); });
+    return o;
+}
+
+function genNsatplotData(sats) {
+    var plt = [];
+    for (var j = 0; j < ntimes; j++) {
+        var nsat = 0;
+        sats.forEach(function (sat) {
+            var azel = sat.azel[j];
+            if (azel && azel.elevation > elemask) nsat++;
+        });
+        plt.push({ x: j, y: nsat });
+    }
+    return plt;
+}
+
+function genAllNsatplotData() {
+    var o = {};
+    SYS.forEach(function (s) { o[s] = genNsatplotData(gnssData[s]); });
+    return o;
+}
+
+function computeDop(ind) {
+    var azs = [], els = [];
+    SYS.forEach(function (sys) {
+        if (!visstate[sys]) return;
+        gnssData[sys].forEach(function (sat) {
+            var azel = sat.azel[ind];
+            if (azel && azel.elevation > elemask) {
+                azs.push(azel.azimuth * D2R);
+                els.push(azel.elevation * D2R);
+            }
+        });
+    });
+    var nsat = azs.length;
+    if (nsat < 4) return { hdop: 999, vdop: 999, pdop: 999 };
+
+    var G = Matrix.Zero(nsat, 4);
+    for (var i = 0; i < nsat; i++) {
+        G.elements[i][0] = Math.cos(els[i]) * Math.sin(azs[i]); // East
+        G.elements[i][1] = Math.cos(els[i]) * Math.cos(azs[i]); // North
+        G.elements[i][2] = Math.sin(els[i]);                    // Up
+        G.elements[i][3] = 1;
+    }
+    var D = (G.transpose().multiply(G)).inverse();
+    return {
+        hdop: Math.sqrt(D.elements[0][0] + D.elements[1][1]),
+        vdop: Math.sqrt(D.elements[2][2]),
+        pdop: Math.sqrt(D.elements[0][0] + D.elements[1][1] + D.elements[2][2])
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Highcharts: satellite-count column chart
+// ---------------------------------------------------------------------------
+function nsatchartdraw(nsatplts, times, llh, elemask) {
+    var cat = [];
+    for (var i = 0; i < ntimes; i++) {
+        cat[i] = Highcharts.dateFormat('%H:%M', times[i] - utcoffset * 60 * 1000);
+    }
+
+    var plotdata = {
+        chart: { type: 'column', renderTo: 'nsatchart' },
+        credits: { enabled: false },
+        title: {
+            text: 'GNSS Radar',
+            style: { fontSize: 'xx-large' },
+            useHTML: true
+        },
+        subtitle: { style: { fontSize: 'medium' } },
+        xAxis: { type: 'datetime', gridLineWidth: 0, tickmarkPlacement: 'on', categories: cat },
+        yAxis: {
+            gridLineWidth: 0, min: 0,
+            title: { text: 'Number of satellite' },
+            stackLabels: { enabled: true, style: { fontWeight: 'bold', color: 'gray' } }
+        },
+        legend: { enabled: false },
+        tooltip: {
+            formatter: function () {
+                return this.x + '<br/><b>' + this.series.name + ': ' + this.y + '</b>';
+            },
+            positioner: function () { return { x: 50, y: 50 }; }
+        },
+        exporting: { scale: 1, sourceHeight: 400, sourceWidth: 800, filename: 'nsat' },
+        plotOptions: {
+            column: {
+                stacking: 'normal', pointPadding: 0, groupPadding: 0, borderWidth: 0,
+                point: {
+                    events: {
+                        click: function () {
+                            for (var i = 0; i < SYS.length; i++) {
+                                nsatchart.series[i].data[tind].update({ color: SYS_COLOR[SYS[i]].line }, true, false);
+                                nsatchart.series[i].data[this.x].update({ color: SYS_COLOR[SYS[i]].dark }, true, false);
+                            }
+                            tind = this.x;
+                            refreshMapMarkers(tind);
+                            if (pinnedSat) showOrbit(pinnedSat, pinnedSys);
+                            dop = computeDop(tind);
+                            skychartdraw(genAllSkyplotData(tind));
+                        }
+                    }
+                }
+            }
+        },
+        series: SYS.map(function (s) { return { name: s, color: SYS_COLOR[s].line }; })
+    };
+
+    var time = new Date();
+    var lt = 'Time: ' + time.getFullYear() + '/' + (time.getMonth() + 1) + '/' + time.getDate() +
+        ' ' + time.getHours() + ':' + (time.getMinutes() < 10 ? '0' : '') + time.getMinutes();
+    var ele = 'Mask:' + elemask.toString() + ' deg';
+    var dopstr = 'HDOP:' + dop.hdop.toFixed(1) + ', PDOP:' + dop.pdop.toFixed(1);
+    var srcstr = usingLiveData ? 'Live TLE' : 'OFFLINE fallback TLE (2014)';
+    plotdata.subtitle.text = lt + '<br> ' + ele + ', ' + dopstr + ' \u2014 ' + srcstr;
+
+    SYS.forEach(function (s, i) { plotdata.series[i].data = nsatplts[s]; });
+
+    nsatchart = new Highcharts.Chart(plotdata);
+    for (var i = 0; i < SYS.length; i++) {
+        if (nsatchart.series[i].data[tind]) {
+            nsatchart.series[i].data[tind].update({ color: SYS_COLOR[SYS[i]].dark }, true, false);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Highcharts: polar sky plot
+// ---------------------------------------------------------------------------
+function skychartdraw(skyplts) {
+    var labels = { '0': 'N', '45': 'NE', '90': 'E', '135': 'SE', '180': 'S', '225': 'SW', '270': 'W', '315': 'NW' };
+
+    var plotdata = {
+        chart: { renderTo: 'skychart', polar: true },
+        credits: { enabled: false },
+        legend: {
+            title: { style: { fontSize: '14px' } },
+            itemStyle: { fontSize: '12px' }
+        },
+        title: { text: '' },
+        subtitle: { text: '' },
+        tooltip: {
+            pointFormat: 'PRN: <b>{point.name}</b><br>EL: <b>{point.y}</b>deg<br>AZ: <b>{point.x}</b>deg',
+            hideDelay: 0
+        },
+        pane: { startAngle: 0, endAngle: 360 },
+        xAxis: {
+            tickInterval: 45, min: 0, max: 360,
+            labels: { formatter: function () { return labels[this.value]; }, style: { fontSize: 'medium' } }
+        },
+        yAxis: { min: 0, max: 90, minorTickInterval: 10, tickInterval: 30, reversed: true, labels: { enabled: false } },
+        exporting: { scale: 1, sourceHeight: 800, sourceWidth: 600, filename: 'skyplot' },
+        plotOptions: {
+            bubble: {
+                minSize: 30, maxSize: 30,
+                dataLabels: {
+                    enabled: true, formatter: function () { return this.point.name; },
+                    y: 4, style: { fontWeight: 'bold', fontSize: 'medium' }
+                },
+                tooltip: { followPointer: false, followTouchMove: false, hideDelay: 0 },
+                events: {
+                    show: function () { onLegendToggle(this, true); },
+                    hide: function () { onLegendToggle(this, false); }
+                }
+            }
+        },
+        series: SYS.map(function (s) { return { type: 'bubble', color: SYS_COLOR[s].hex, pointPlacement: 'between' }; })
+    };
+
+    SYS.forEach(function (s, i) {
+        var pts = skyplts[s];
+        plotdata.series[i].data = pts;
+        plotdata.series[i].name = s + '(' + pts.length.toString() + ')';
+        plotdata.series[i].visible = visstate[s];
+    });
+
+    var nsat = 0;
+    SYS.forEach(function (s) { nsat += skyplts[s].length; });
+    plotdata.legend.title = {
+        text: 'GNSS (' + nsat.toString() + ') ' +
+            '<span style="color: #666; font-weight: normal; font-size: 14px">click to hide</span>',
+        style: { fontSize: '14px' }
+    };
+
+    skychart = new Highcharts.Chart(plotdata);
+}
+
+// Single source of truth for constellation on/off state. Both the sky-chart
+// legend (Highcharts show/hide events) and the map's checkbox panel call
+// into this, and it keeps the other one in sync. `source` tracks which UI
+// triggered the change so we don't recurse: e.g. the panel checkbox calls
+// skychart.series.hide(), which fires Highcharts' own 'hide' event, which
+// would call back in here - the syncInProgress guard makes that a no-op
+// instead of an infinite loop (the first pass already did all the work).
+var syncInProgress = false;
+
+function setConstellationVisible(sys, visible, source) {
+    if (syncInProgress) return;
+    syncInProgress = true;
+    try {
+        visstate[sys] = visible;
+        applyVisibilityToMap();
+        dop = computeDop(tind);
+
+        var idx = SYS.indexOf(sys);
+        var sp = nsatchart.options.subtitle.text.split('<br>');
+        var newtext = sp[0] + '<br>' + 'Mask:' + elemask.toString() + ' deg' +
+            ', HDOP:' + dop.hdop.toFixed(1) + ', PDOP:' + dop.pdop.toFixed(1);
+        nsatchart.setTitle(nsatchart.options.title, { text: newtext });
+        if (visible) nsatchart.series[idx].show();
+        else nsatchart.series[idx].hide();
+
+        if (panelCheckboxes[sys]) panelCheckboxes[sys].checked = visible;
+
+        if (source !== 'chart' && skychart && skychart.series[idx]) {
+            if (visible) skychart.series[idx].show();
+            else skychart.series[idx].hide();
+        }
+    } finally {
+        syncInProgress = false;
+    }
+}
+
+function onLegendToggle(series, visible) {
+    setConstellationVisible(SYS[series.index], visible, 'chart');
+}
+
+// ---------------------------------------------------------------------------
+// Map panel: checkbox per constellation, overlaid on the map, kept in sync
+// with the sky-chart legend via setConstellationVisible() above.
+// ---------------------------------------------------------------------------
+var panelCheckboxes = {};
+
+function buildConstellationPanel() {
+    var panel = document.getElementById('syspanel');
+    SYS.forEach(function (sys) {
+        var row = document.createElement('label');
+        row.className = 'syspanel-row';
+
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = visstate[sys];
+        cb.addEventListener('change', function () {
+            setConstellationVisible(sys, cb.checked, 'panel');
+        });
+        panelCheckboxes[sys] = cb;
+
+        var swatch = document.createElement('span');
+        swatch.className = 'syspanel-swatch';
+        swatch.style.background = SYS_COLOR[sys].hex;
+
+        var label = document.createElement('span');
+        label.textContent = sys + ' (' + gnssData[sys].length + ')';
+
+        row.appendChild(cb);
+        row.appendChild(swatch);
+        row.appendChild(label);
+        panel.appendChild(row);
+    });
+}
+</script>
+</body>
+</html>
